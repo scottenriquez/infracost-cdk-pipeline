@@ -1,0 +1,9 @@
+version: 0.1
+resource_usage:
+  aws_lambda_function.function:
+    monthly_requests: 10000 
+    request_duration_ms: 250
+  aws_s3_bucket.bucket:
+    standard:
+      storage_gb: 10000
+      monthly_tier_1_requests: 1000 
