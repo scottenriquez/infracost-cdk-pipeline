@@ -4,7 +4,8 @@ import { Construct } from 'constructs';
 import * as codebuild from 'aws-cdk-lib/aws-codebuild';
 import * as codecommit from 'aws-cdk-lib/aws-codecommit';
 import * as codepipeline from 'aws-cdk-lib/aws-codepipeline';
-import * as codepipeline_actions from 'aws-cdk-lib/aws-codepipeline-actions'
+import * as codepipeline_actions from 'aws-cdk-lib/aws-codepipeline-actions';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as uuid from 'uuid';
@@ -16,6 +17,23 @@ export class InfracostCdkPipelineStack extends Stack {
     const terraformStateBucket = new s3.Bucket(this, 'TerraformStateBucket', {
       bucketName: `terraform-state-${uuid.v4()}`,
       removalPolicy: RemovalPolicy.DESTROY
+    });
+    const terraformS3IAMPolicyForCodeBuild = new iam.ManagedPolicy(this, 'ManagedPolicy', {
+      statements: [
+        new iam.PolicyStatement({
+        actions: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject'],
+        resources: [terraformStateBucket.arnForObjects('*')]
+        }),
+        new iam.PolicyStatement({
+          actions: ['s3:ListBucket'],
+          resources: ['*']
+        })
+      ]
+    });
+    const terraformS3IAMRoleForCodeBuild = new iam.Role(this, 'Role', {
+      assumedBy: new iam.ServicePrincipal('codebuild.amazonaws.com'),
+      description: 'IAM role for CodeBuild to interact with S3',
+      managedPolicies: [terraformS3IAMPolicyForCodeBuild]
     });
     const terraformRepository = new codecommit.Repository(this, 'TerraformRepository', {
       repositoryName: 'TerraformRepository',
@@ -36,7 +54,7 @@ export class InfracostCdkPipelineStack extends Stack {
           },
           build: {
             commands:[
-              `terraform init -backend-config="${terraformStateBucket.bucketName}"`,
+              `terraform init -backend-config="bucket=${terraformStateBucket.bucketName}"`,
               'terraform plan'
             ]
           }
@@ -44,10 +62,15 @@ export class InfracostCdkPipelineStack extends Stack {
       }),
       source: codebuild.Source.codeCommit({
         repository: terraformRepository
-      })
+      }),
+      environment: {
+        buildImage: codebuild.LinuxBuildImage.AMAZON_LINUX_2_3,
+        privileged: true
+      },
+      role: terraformS3IAMRoleForCodeBuild
     });
     const pullRequestStateChangeRule = terraformRepository.onPullRequestStateChange('TerraformRepositoryOnPullRequestStateChange', {
-      target: new targets.CodeBuildProject(pullRequestCodeBuildProject)
+      target: new targets.CodeBuildProject(pullRequestCodeBuildProject),
     });
     const terraformCodeBuildProject = new codebuild.PipelineProject(this, 'TerraformCodeBuildProject', {
       buildSpec: codebuild.BuildSpec.fromObject({
@@ -64,15 +87,17 @@ export class InfracostCdkPipelineStack extends Stack {
           },
           build: {
             commands:[
-              `terraform init -backend-config="${terraformStateBucket.bucketName}"`,
+              `terraform init -backend-config="bucket=${terraformStateBucket.bucketName}"`,
               'terraform plan'
             ]
           }
         }
       }),
       environment: {
-        buildImage: codebuild.LinuxBuildImage.AMAZON_LINUX_2_3
-      }
+        buildImage: codebuild.LinuxBuildImage.AMAZON_LINUX_2_3,
+        privileged: true
+      },
+      role: terraformS3IAMRoleForCodeBuild
     });
     const terraformPipeline = new codepipeline.Pipeline(this, 'TerraformPipeline', {
       pipelineName: 'TerraformPipeline'
