@@ -13,11 +13,18 @@ import * as uuid from 'uuid';
 export class InfracostCdkPipelineStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
-    const terraformVersion = '1.2.4'; 
+    // constants
+    const terraformVersion = '1.2.4';
+    const mainBranchName = 'main';
+    const infracostAPIKeyParameterSecureStringName = '/terraform/infracost/api_key';
+
+    // Terraform state management
     const terraformStateBucket = new s3.Bucket(this, 'TerraformStateBucket', {
       bucketName: `terraform-state-${uuid.v4()}`,
       removalPolicy: RemovalPolicy.DESTROY
     });
+
+    // IAM permissions for CodeBuild
     const terraformS3IAMPolicyForCodeBuild = new iam.ManagedPolicy(this, 'ManagedPolicy', {
       statements: [
         new iam.PolicyStatement({
@@ -33,12 +40,16 @@ export class InfracostCdkPipelineStack extends Stack {
     const terraformS3IAMRoleForCodeBuild = new iam.Role(this, 'Role', {
       assumedBy: new iam.ServicePrincipal('codebuild.amazonaws.com'),
       description: 'IAM role for CodeBuild to interact with S3',
-      managedPolicies: [terraformS3IAMPolicyForCodeBuild]
+      managedPolicies: [terraformS3IAMPolicyForCodeBuild, iam.ManagedPolicy.fromAwsManagedPolicyName('AWSCodeCommitReadOnly')]
     });
+
+    // Terraform source code
     const terraformRepository = new codecommit.Repository(this, 'TerraformRepository', {
       repositoryName: 'TerraformRepository',
-      code: codecommit.Code.fromDirectory(path.join(__dirname, 'terraform/'), 'main')
+      code: codecommit.Code.fromDirectory(path.join(__dirname, 'terraform/'), mainBranchName)
     });
+
+    // pull request build and integration
     const pullRequestCodeBuildProject = new codebuild.Project(this, 'TerraformPullRequestCodeBuildProject', {
       buildSpec: codebuild.BuildSpec.fromObject({
         version: '0.2',
@@ -46,16 +57,20 @@ export class InfracostCdkPipelineStack extends Stack {
           install: {
             commands: [
               `wget https://releases.hashicorp.com/terraform/${terraformVersion}/terraform_${terraformVersion}_linux_amd64.zip`,
-              'sudo yum -y install unzip',
+              'sudo yum -y install unzip python3-pip',
               `unzip terraform_${terraformVersion}_linux_amd64.zip`,
               'sudo mv terraform /usr/local/bin/',
-              'terraform --version'
+              'curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh',
+              'sudo pip3 install git-remote-codecommit',
+              `git clone ${terraformRepository.repositoryCloneUrlGrc} --branch=${mainBranchName} --single-branch /tmp/main`,
+              'infracost breakdown --path /tmp/main --usage-file infracost-usage.yml --format json --out-file infracost-base.json'
             ]
           },
           build: {
             commands:[
               `terraform init -backend-config="bucket=${terraformStateBucket.bucketName}"`,
-              'terraform plan'
+              'terraform plan',
+              'infracost diff --path . --compare-to infracost-base.json --usage-file infracost-usage.yml'
             ]
           }
         }
@@ -65,6 +80,12 @@ export class InfracostCdkPipelineStack extends Stack {
       }),
       environment: {
         buildImage: codebuild.LinuxBuildImage.AMAZON_LINUX_2_3,
+        environmentVariables: {
+          INFRACOST_API_KEY: {
+            value: infracostAPIKeyParameterSecureStringName,
+            type: codebuild.BuildEnvironmentVariableType.PARAMETER_STORE
+          }
+        },
         privileged: true
       },
       role: terraformS3IAMRoleForCodeBuild
@@ -72,6 +93,8 @@ export class InfracostCdkPipelineStack extends Stack {
     const pullRequestStateChangeRule = terraformRepository.onPullRequestStateChange('TerraformRepositoryOnPullRequestStateChange', {
       target: new targets.CodeBuildProject(pullRequestCodeBuildProject),
     });
+
+    // pipeline
     const terraformCodeBuildProject = new codebuild.PipelineProject(this, 'TerraformCodeBuildProject', {
       buildSpec: codebuild.BuildSpec.fromObject({
         version: '0.2',
@@ -82,19 +105,25 @@ export class InfracostCdkPipelineStack extends Stack {
               'sudo yum -y install unzip',
               `unzip terraform_${terraformVersion}_linux_amd64.zip`,
               'sudo mv terraform /usr/local/bin/',
-              'terraform --version'
+              'curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh'
             ]
           },
           build: {
             commands:[
               `terraform init -backend-config="bucket=${terraformStateBucket.bucketName}"`,
-              'terraform plan'
+              'terraform plan',
+              'infracost breakdown --path . --usage-file infracost-usage.yml --format table'
             ]
           }
         }
       }),
       environment: {
         buildImage: codebuild.LinuxBuildImage.AMAZON_LINUX_2_3,
+        environmentVariables: {
+          INFRACOST_API_KEY: {
+            value: process.env.INFRACOST_API_KEY
+          }
+        },
         privileged: true
       },
       role: terraformS3IAMRoleForCodeBuild
@@ -108,7 +137,7 @@ export class InfracostCdkPipelineStack extends Stack {
     const sourceArtifact = new codepipeline.Artifact();
     sourceStage.addAction(new codepipeline_actions.CodeCommitSourceAction({
       actionName: 'Source',
-      branch: 'main',
+      branch: mainBranchName,
       output: sourceArtifact,
       repository: terraformRepository
     }));
