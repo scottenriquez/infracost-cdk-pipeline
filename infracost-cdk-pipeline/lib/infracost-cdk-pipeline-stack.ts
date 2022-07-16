@@ -23,6 +23,7 @@ export class InfracostCdkPipelineStack extends Stack {
 
     // Terraform state management
     const terraformStateBucket = new s3.Bucket(this, 'TerraformStateBucket', {
+      autoDeleteObjects: true,
       bucketName: `terraform-state-${uuid.v4()}`,
       removalPolicy: RemovalPolicy.DESTROY
     });
@@ -51,10 +52,14 @@ export class InfracostCdkPipelineStack extends Stack {
         })
       ]
     });
-    const terraformPullRequestCodeBuildRole = new iam.Role(this, 'Role', {
+    const terraformPlanCodeBuildRole = new iam.Role(this, 'TerraformPlanCodeBuildRole', {
       assumedBy: new iam.ServicePrincipal('codebuild.amazonaws.com'),
       description: 'IAM role for CodeBuild to interact with S3',
-      managedPolicies: [terraformS3IAMPolicyForCodeBuild, terraformSNSIAMPolicyForCodeBuild, iam.ManagedPolicy.fromAwsManagedPolicyName('AWSCodeCommitReadOnly')]
+      managedPolicies: [
+        terraformS3IAMPolicyForCodeBuild,
+        terraformSNSIAMPolicyForCodeBuild, 
+        iam.ManagedPolicy.fromAwsManagedPolicyName('AWSCodeCommitReadOnly'), 
+        iam.ManagedPolicy.fromAwsManagedPolicyName('ReadOnlyAccess')]
     });
 
     // Terraform source code
@@ -105,7 +110,7 @@ export class InfracostCdkPipelineStack extends Stack {
         },
         privileged: true
       },
-      role: terraformPullRequestCodeBuildRole
+      role: terraformPlanCodeBuildRole 
     });
     const pullRequestStateChangeRule = terraformRepository.onPullRequestStateChange('TerraformRepositoryOnPullRequestStateChange', {
       target: new targets.CodeBuildProject(pullRequestCodeBuildProject, {
@@ -115,8 +120,57 @@ export class InfracostCdkPipelineStack extends Stack {
       })
     });
 
+    // IAM permissions for pipeline
+    const terraformCodeBuildDeployRole = new iam.Role(this, 'TerraformCodeBuildDeployRole', {
+      assumedBy: new iam.ServicePrincipal('codebuild.amazonaws.com'),
+      description: 'IAM role for Terraform deployments in CodeBuild',
+      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('AdministratorAccess')]
+    });
+
     // pipeline
-    const terraformCodeBuildProject = new codebuild.PipelineProject(this, 'TerraformCodeBuildProject', {
+    const codePipelineArtifactBucket = new s3.Bucket(this, 'CodePipelineArtifactBucket', {
+      autoDeleteObjects: true,
+      bucketName: `codepipeline-artifact-${uuid.v4()}`,
+      removalPolicy: RemovalPolicy.DESTROY
+    });
+    const terraformPlanCodeBuildProject = new codebuild.PipelineProject(this, 'TerraformPlanCodeBuildProject', {
+      buildSpec: codebuild.BuildSpec.fromObject({
+        version: '0.2',
+        artifacts: {
+          files: ['*.tf', 'lambda/*', 'tfplan.out']
+        },
+        phases: {
+          install: {
+            commands: [
+              `wget https://releases.hashicorp.com/terraform/${terraformVersion}/terraform_${terraformVersion}_linux_amd64.zip`,
+              'sudo yum -y install unzip',
+              `unzip terraform_${terraformVersion}_linux_amd64.zip`,
+              'sudo mv terraform /usr/local/bin/',
+              'curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh'
+            ]
+          },
+          build: {
+            commands:[
+              `terraform init -backend-config="bucket=${terraformStateBucket.bucketName}"`,
+              'terraform plan -out tfplan.out',
+              'infracost breakdown --path . --usage-file infracost-usage.yml --format table'
+            ]
+          }
+        }
+      }),
+      environment: {
+        buildImage: codebuild.LinuxBuildImage.AMAZON_LINUX_2_3,
+        environmentVariables: {
+          INFRACOST_API_KEY: {
+            value: infracostAPIKeyParameterSecureStringName,
+            type: codebuild.BuildEnvironmentVariableType.PARAMETER_STORE
+          }
+        },
+        privileged: true
+      },
+      role: terraformPlanCodeBuildRole 
+    });
+    const terraformApplyCodeBuildProject = new codebuild.PipelineProject(this, 'TerraformApplyCodeBuildProject', {
       buildSpec: codebuild.BuildSpec.fromObject({
         version: '0.2',
         phases: {
@@ -132,8 +186,7 @@ export class InfracostCdkPipelineStack extends Stack {
           build: {
             commands:[
               `terraform init -backend-config="bucket=${terraformStateBucket.bucketName}"`,
-              'terraform plan',
-              'infracost breakdown --path . --usage-file infracost-usage.yml --format table'
+              'terraform apply tfplan.out',
             ]
           }
         }
@@ -142,14 +195,16 @@ export class InfracostCdkPipelineStack extends Stack {
         buildImage: codebuild.LinuxBuildImage.AMAZON_LINUX_2_3,
         environmentVariables: {
           INFRACOST_API_KEY: {
-            value: process.env.INFRACOST_API_KEY
+            value: infracostAPIKeyParameterSecureStringName,
+            type: codebuild.BuildEnvironmentVariableType.PARAMETER_STORE
           }
         },
         privileged: true
       },
-      role: terraformPullRequestCodeBuildRole
+      role: terraformCodeBuildDeployRole 
     });
     const terraformPipeline = new codepipeline.Pipeline(this, 'TerraformPipeline', {
+      artifactBucket: codePipelineArtifactBucket,
       pipelineName: 'TerraformPipeline'
     });
     const sourceStage = terraformPipeline.addStage({
@@ -162,13 +217,37 @@ export class InfracostCdkPipelineStack extends Stack {
       output: sourceArtifact,
       repository: terraformRepository
     }));
+    const approveBuildStage = terraformPipeline.addStage({ 
+      stageName: 'ApproveBuild' 
+    });
+    const buildManualApprovalAction = new codepipeline_actions.ManualApprovalAction({
+      actionName: 'ApproveBuild',
+    });
+    approveBuildStage.addAction(buildManualApprovalAction);
     const buildStage = terraformPipeline.addStage({
       stageName: 'Build'
     });
+    const terraformPlanArtifact = new codepipeline.Artifact();
     buildStage.addAction(new codepipeline_actions.CodeBuildAction({
       actionName: 'BuildTerraform',
       input: sourceArtifact,
-      project: terraformCodeBuildProject
+      outputs: [terraformPlanArtifact],
+      project: terraformPlanCodeBuildProject
+    }));
+    const approveDeployStage = terraformPipeline.addStage({ 
+      stageName: 'ApproveDeploy' 
+    });
+    const deployManualApprovalAction = new codepipeline_actions.ManualApprovalAction({
+      actionName: 'ApproveDeploy',
+    });
+    approveDeployStage.addAction(deployManualApprovalAction);
+    const deployStage = terraformPipeline.addStage({
+      stageName: 'Deploy'
+    });
+    deployStage.addAction(new codepipeline_actions.CodeBuildAction({
+      actionName: 'DeployTerraform',
+      input: terraformPlanArtifact,
+      project: terraformApplyCodeBuildProject
     }));
   }
 }
