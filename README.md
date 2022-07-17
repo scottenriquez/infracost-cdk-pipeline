@@ -5,7 +5,7 @@ One such aspect is providing developers visibility into the impact of their code
 
 ## Solution Architecture 
 This solution deploys several resources:
-- A CodeCommit repository pre-loaded with Terraform for a VPC, EC2 instance, S3 bucket, and Lambda function
+- A CodeCommit repository pre-loaded with Terraform code for a VPC, EC2 instance, S3 bucket, and Lambda function to serve as some example infrastructure costs to monitor
 - A CodeBuild project triggered by pull request state changes that analyzes cost changes relative to the `main` branch
 - A CodePipeline with manual approvals to deploy the Terraform for changes pushed to the `main` branch
 - An SNS topic to notify developers of cost changes
@@ -16,7 +16,7 @@ This solution deploys several resources:
 ## Preparing Your Development Environment 
 While this solution is for writing, deploying, and analyzing Terraform HCL syntax, I wrote the infrastructure code for the deployment pipeline and dependent resources using AWS CDK, which is my daily driver for infrastructure as code. Of course, the source code could be rewritten using Terraform or [CDK for Terraform](https://www.terraform.io/cdktf), but I used CDK for the sake of a quick prototype that only creates AWS resources (i.e., no need for additional providers). In addition, Infracost currently only supports Terraform, but there are [plans for CloudFormation and CDK](https://www.infracost.io/docs/supported_resources/overview/) in the future.
 
-The following dependencies are required for the application:
+The following dependencies are required to deploy the pipeline infrastructure:
 - An AWS account
 - Node.js
 - Terraform
@@ -24,7 +24,7 @@ The following dependencies are required for the application:
 - [An Infracost API key](https://www.infracost.io/docs/)
 - [Source code](https://github.com/scottenriquez/infracost-cdk-pipeline)
 
-Rather than installing Node.js, CDK, Terraform, and all other dependencies on your local machine, you can alternatively create a [Cloud9 IDE](https://aws.amazon.com/cloud9/) with these pre-installed via the Console or with CloudFormation:
+Rather than installing Node.js, CDK, Terraform, and all other dependencies on your local machine, you can alternatively create a [Cloud9 IDE](https://aws.amazon.com/cloud9/) with these pre-installed via the Console or with a CloudFormation template:
 ```yaml
 Resources:
   rCloud9Environment:
@@ -33,6 +33,7 @@ Resources:
       AutomaticStopTimeMinutes: 30
       ConnectionType: CONNECT_SSH 
       Description: Environment for writing and deploying CDK 
+      # AWS Free Tier eligible
       InstanceType: t2.micro	
       Name: InfracostCDKPipelineCloud9Environment
       # https://docs.aws.amazon.com/cloud9/latest/user-guide/vpc-settings.html#vpc-settings-create-subnet
@@ -40,9 +41,9 @@ Resources:
 ```
 
 ## Installation, Deployment, and Configuration
-Before deploying the CDK application, [store the Infracost API key](https://docs.aws.amazon.com/systems-manager/latest/userguide/parameter-create-console.html) in an SSM parameter `SecureString` called `/terraform/infracost/api_key`.
+Before deploying the CDK application, [store the Infracost API key in an SSM parameter](https://docs.aws.amazon.com/systems-manager/latest/userguide/parameter-create-console.html) `SecureString` called `/terraform/infracost/api_key`.
 
-To install and deploy the application, use the following commands:
+To install and deploy the pipeline, use the following commands:
 ```shell
 git clone https://github.com/scottenriquez/infracost-cdk-pipeline.git
 cd infracost-cdk-pipeline/infracost-cdk-pipeline/
@@ -52,12 +53,12 @@ cdk bootstrap
 cdk deploy
 ```
 
-Before testing the pipeline, subscribe to the SNS topic via the Console. For testing purposes, use email to get the cost change data delivered.
+Before testing the pipeline, [subscribe to the SNS topic via the Console](https://docs.aws.amazon.com/sns/latest/dg/sns-create-subscribe-endpoint-to-topic.html). For testing purposes, use email to get the cost change data delivered.
 
 ## Using the Deployment Pipeline
-The CodePipeline is triggered at creation, but there are manual approval stages to prevent any infrastructure from being created without intervention. Feel free to deploy the Terraform, but it is not required for generating cost differences.
+The CodePipeline is triggered at creation, but there are manual approval stages to prevent any infrastructure from being created without intervention. Feel free to deploy the Terraform, but it is not required for generating cost differences via a pull request. The CodePipeline is triggered by changes to `main`.
 
-Next, make some changes to see the cost impact. To modify the Terraform code, either use the CodeCommit GUI in the Console or clone the repository to your development environment. First, create a branch called `feature` off of `main`. Then modify `ec2.tf` to use a different instance type:
+Make some code changes to see the cost impact. To modify the Terraform code, either use the CodeCommit GUI in the Console or clone the repository to your development environment. First, create a branch called `feature` off of `main`. Then modify `ec2.tf` to use a different instance type:
 ```hcl
 resource "aws_instance" "server" {
   # Amazon Linux 2 Kernel 5.10 AMI 2.0.20220606.1 x86_64 HVM in us-east-1
@@ -89,7 +90,7 @@ resource_usage:
       monthly_tier_1_requests: 1000 
 ```
 
-Commit these changes to the `feature` branch and open a pull request. Doing so will trigger the CodeBuild project that computes the cost delta and publishes the payload to the SNS topic if the amount increases. Assuming you subscribed to the SNS topic, some JSON should be in your inbox. Here's an abridged example:
+Commit these changes to the `feature` branch and open a pull request. Doing so will trigger the CodeBuild project that computes the cost delta and publishes the payload to the SNS topic if the amount increases. Assuming you subscribed to the SNS topic via email, some JSON should be in your inbox. Here's an abridged example output:
 ```json
 {
 	"version": "0.2",
@@ -130,7 +131,7 @@ Commit these changes to the `feature` branch and open a pull request. Doing so w
 ```
 
 ## Diving Into the Pull Request Build Logic
-The TypeScript for describing the deployment pipeline lives in `infracost-cdk-pipeline-stack.ts`. The following code snippet contains the core logic for integrating Infracost into the pull request (note the comments in the build phase):
+The TypeScript for describing the deployment pipeline lives in `infracost-cdk-pipeline-stack.ts`. The following code snippet (with comments explaining the `install` and `build` phases) contains the core logic for integrating Infracost into the pull request: 
 ```typescript
 const pullRequestCodeBuildProject = new codebuild.Project(this, 'TerraformPullRequestCodeBuildProject', {
     buildSpec: codebuild.BuildSpec.fromObject({
@@ -170,10 +171,10 @@ const pullRequestCodeBuildProject = new codebuild.Project(this, 'TerraformPullRe
 });
 ```
 
-More advanced notification logic, such as using the percentage increase for an alert threshold, could be implemented to minimize noise for developers. Additionally, offloading the logic to a Lambda function and invoking it via the CLI would allow for more robust and testable logic than a simple Shell script.
+More advanced notification logic, such as using the percentage increase for an alert threshold, could be implemented to minimize noise for developers. Additionally, offloading the logic to a Lambda function and invoking it via the CLI or SNS would allow for more robust and testable logic than a simple shell script. Alternatively, the cost delta could be added as a comment on the source pull request. Choose the option that makes the most sense for your code review process.
 
 ## Conclusion
-Technology alone will not resolve all cost optimization challenges. However, integrating cost analysis into code reviews is integral to shaping a cost-conscious culture. It is much better to find and address cost spikes before infrastructure is deployed. Seeing a massive number from `infracost diff` is scary, but seeing it in Cost Explorer is far scarier.
+Technology alone will not resolve all cost optimization challenges. However, integrating cost analysis into code reviews is integral to shaping a cost-conscious culture. It is much better to find and address cost spikes before infrastructure is deployed. Seeing a large cost increase from `infracost diff` is scary, but seeing it in Cost Explorer later is far scarier.
 
 ## Cleanup
 If you deployed resources via the deployment pipeline, be sure to either use the `DestroyTerraform` CodeBuild project or run:
