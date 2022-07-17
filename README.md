@@ -45,7 +45,7 @@ Before deploying the CDK application, [store the Infracost API key](https://docs
 To install and deploy the application, use the following commands:
 ```shell
 git clone https://github.com/scottenriquez/infracost-cdk-pipeline.git
-cd infracost-cdk-pipeline
+cd infracost-cdk-pipeline/infracost-cdk-pipeline/
 npm install
 # https://docs.aws.amazon.com/cdk/v2/guide/bootstrapping.html
 cdk bootstrap
