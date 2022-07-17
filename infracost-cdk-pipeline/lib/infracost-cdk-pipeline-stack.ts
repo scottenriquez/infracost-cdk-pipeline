@@ -69,7 +69,7 @@ export class InfracostCdkPipelineStack extends Stack {
     });
 
     // pull request build and integration
-    const pullRequestCodeBuildProject = new codebuild.Project(this, 'TerraformPullRequestCodeBuildProject', {
+    const terraformPullRequestCodeBuildProject = new codebuild.Project(this, 'TerraformPullRequestCodeBuildProject', {
       buildSpec: codebuild.BuildSpec.fromObject({
         version: '0.2',
         phases: {
@@ -113,7 +113,7 @@ export class InfracostCdkPipelineStack extends Stack {
       role: terraformPlanCodeBuildRole 
     });
     const pullRequestStateChangeRule = terraformRepository.onPullRequestStateChange('TerraformRepositoryOnPullRequestStateChange', {
-      target: new targets.CodeBuildProject(pullRequestCodeBuildProject, {
+      target: new targets.CodeBuildProject(terraformPullRequestCodeBuildProject, {
         event: events.RuleTargetInput.fromObject({
           sourceVersion: events.EventField.fromPath('$.detail.sourceReference'),
         }),
@@ -249,5 +249,36 @@ export class InfracostCdkPipelineStack extends Stack {
       input: terraformPlanArtifact,
       project: terraformApplyCodeBuildProject
     }));
+
+    // destroy build
+    const terraformDestroyCodeBuildProject = new codebuild.Project(this, 'TerraformDestroyCodeBuildProject', {
+      buildSpec: codebuild.BuildSpec.fromObject({
+        version: '0.2',
+        phases: {
+          install: {
+            commands: [
+              'sudo yum -y install unzip',
+              `wget https://releases.hashicorp.com/terraform/${terraformVersion}/terraform_${terraformVersion}_linux_amd64.zip`,
+              `unzip terraform_${terraformVersion}_linux_amd64.zip`,
+              'sudo mv terraform /usr/local/bin/'
+            ]
+          },
+          build: {
+            commands:[
+              `terraform init -backend-config="bucket=${terraformStateBucket.bucketName}"`,
+              'terraform destroy -auto-approve'
+            ]
+          }
+        }
+      }),
+      source: codebuild.Source.codeCommit({
+        repository: terraformRepository
+      }),
+      environment: {
+        buildImage: codebuild.LinuxBuildImage.AMAZON_LINUX_2_3,
+        privileged: true
+      },
+      role: terraformCodeBuildDeployRole 
+    });
   }
 }
