@@ -113,10 +113,16 @@ export class InfracostCdkPipelineStack extends Stack {
       role: terraformPlanCodeBuildRole 
     });
     const pullRequestStateChangeRule = terraformRepository.onPullRequestStateChange('TerraformRepositoryOnPullRequestStateChange', {
+      eventPattern: {
+        detail: {
+          // only run build for open pull requests
+          pullRequestStatus: ['Open']
+        } 
+      },
       target: new targets.CodeBuildProject(terraformPullRequestCodeBuildProject, {
         event: events.RuleTargetInput.fromObject({
-          sourceVersion: events.EventField.fromPath('$.detail.sourceReference'),
-        }),
+          sourceVersion: events.EventField.fromPath('$.detail.sourceReference')
+        })
       })
     });
 
